@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai
+pydantic
+numpy
+beautifulsoup4
+python-dateutil
+requests
