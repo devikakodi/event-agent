@@ -20,7 +20,6 @@ EVENT_SOURCES = [
     "https://www.edge-ai-vision.com/the-alliance/events/",  
     "https://aaai.org/conference/aaai/",                    
     "https://techequity-ai.org/ai-alliance-dev-2025/"
-    # Add more URLs here
 ]
 
 

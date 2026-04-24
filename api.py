@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, JSONResponse
 from agent import ask_agent_structured, get_personalized_recommendations
+import sqlite3
 
 app = FastAPI()
 
@@ -24,33 +25,74 @@ def search_events(request: SearchRequest):
         "count": data["count"],
         "events": [
             {
+                "id": e.get("id", ""),
                 "title": e["title"],
                 "date": e["date"],
                 "location": e["location"],
+                "organizer": e.get("organizer"),
                 "link": e["link"],
             }
             for e in data["events"]
+        ],
+        "past_events": [
+            {
+                "id": e.get("id", ""),
+                "title": e["title"],
+                "date": e["date"],
+                "location": e["location"],
+                "organizer": e.get("organizer"),
+                "link": e["link"],
+            }
+            for e in data.get("past_events", [])
         ]
     })
 
 
+@app.get("/click/{event_id}")
+def track_click(event_id: str):
+    conn = sqlite3.connect("events.db")
+    row = conn.execute("SELECT link FROM events WHERE id = ?", (event_id,)).fetchone()
+    if row:
+        conn.execute("UPDATE events SET click_count = COALESCE(click_count, 0) + 1 WHERE id = ?", (event_id,))
+        conn.commit()
+        link = row[0]
+        conn.close()
+        return RedirectResponse(url=link)
+    conn.close()
+    return JSONResponse(content={"error": "not found"}, status_code=404)
+
+
 @app.get("/recommend")
-def recommend(limit: int = 10):
-    rows, recent_location, topics = get_personalized_recommendations(limit)
+def recommend(limit: int =5, location: str = "New York"):
+    rows, user_location, topics, popular = get_personalized_recommendations(limit, location)
     return JSONResponse(content={
         "based_on": {
-            "recent_location": recent_location,
+            "recent_location": user_location,
             "topics": list(topics)[:8],
         },
         "recommendations": [
             {
+                "id": r["id"] if "id" in r.keys() else "",
                 "title": r["title"],
                 "date": r["date_iso"],
                 "location": r["location"],
+                "organizer": r["organizer"] if r["organizer"] else None,
                 "link": r["link"],
                 "popularity": r["search_count"],
             }
             for r in rows
+        ],
+        "popular": [
+            {
+                "id": r["id"] if "id" in r.keys() else "",
+                "title": r["title"],
+                "date": r["date_iso"],
+                "location": r["location"],
+                "organizer": r["organizer"] if r["organizer"] else None,
+                "link": r["link"],
+                "popularity": r["click_count"],
+            }
+            for r in popular
         ]
     })
 
@@ -86,21 +128,18 @@ def home():
         .btn-recommend { background: #059669; color: white; }
         .btn-recommend:hover { background: #047857; }
 
-        /* Result header line e.g. "Returned 7 events for events in New York" */
         .result-header {
             font-size: 14px; color: #6b7280; margin-bottom: 18px;
             padding-bottom: 10px; border-bottom: 1px solid #e5e7eb;
         }
         .result-header strong { color: #111; }
 
-        /* Section headers for recommend */
         .section-header {
             font-size: 13px; font-weight: 700; text-transform: uppercase;
             letter-spacing: 0.6px; color: #6b7280; margin: 24px 0 12px;
         }
         .section-header:first-of-type { margin-top: 0; }
 
-        /* Event row */
         .event {
             background: white; border: 1px solid #e5e7eb; border-radius: 9px;
             padding: 14px 16px; margin-bottom: 10px;
@@ -116,19 +155,34 @@ def home():
         .event-meta a { color: #4f46e5; text-decoration: none; }
         .event-meta a:hover { text-decoration: underline; }
 
+        .location-box {
+            margin-top: 20px; padding: 14px; background: white;
+            border: 1px solid #e5e7eb; border-radius: 9px;
+        }
+        .location-box p { font-size: 13px; color: #6b7280; margin-bottom: 8px; }
+        .location-box .row { display: flex; gap: 8px; }
+        .location-box input {
+            flex: 1; padding: 9px 12px; border: 1px solid #d1d5db;
+            border-radius: 7px; font-size: 13px; outline: none;
+        }
+        .location-box button {
+            padding: 9px 16px; background: #059669; color: white;
+            border: none; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer;
+        }
+
         .loading { text-align: center; color: #9ca3af; padding: 48px 0; font-size: 14px; }
         .empty   { text-align: center; color: #9ca3af; padding: 48px 0; font-size: 14px; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🔎 Event Intelligence</h1>
+        <h1>&#128269; Event Intelligence</h1>
     </div>
     <div class="container">
         <div class="search-bar">
             <input id="query" placeholder='Try "AI events in west coast" or "machine learning in Europe"' />
             <button class="btn-search" onclick="search()">Search</button>
-            <button class="btn-recommend" onclick="recommend()">Recommend</button>
+            <button class="btn-recommend" onclick="recommend('New York')">Recommend</button>
         </div>
         <div id="results"></div>
     </div>
@@ -138,7 +192,6 @@ def home():
             const query = document.getElementById("query").value.trim();
             if (!query) return;
             document.getElementById("results").innerHTML = '<div class="loading">Searching...</div>';
-
             const res = await fetch("/search", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
@@ -148,23 +201,26 @@ def home():
             renderSearch(data, query);
         }
 
-        async function recommend() {
+        async function recommend(location) {
             document.getElementById("results").innerHTML = '<div class="loading">Loading recommendations...</div>';
-            const res = await fetch("/recommend");
+            const loc = location || "";
+            const res = await fetch("/recommend?location=" + encodeURIComponent(loc));
             const data = await res.json();
             renderRecommend(data);
         }
 
         function eventCard(num, e) {
+            const organizer = e.organizer ? "<br>&#127970; " + e.organizer : "";
+            const link = e.id ? "/click/" + e.id : e.link;
             return `
             <div class="event">
                 <div class="event-number">${num}.</div>
                 <div class="event-body">
                     <div class="event-title">${e.title}</div>
                     <div class="event-meta">
-                        📅 ${e.date || 'TBD'}<br>
-                        📍 ${e.location || 'Unknown'}<br>
-                        🔗 <a href="${e.link}" target="_blank">${e.link}</a>
+                        &#128197; ${e.date || 'TBD'}<br>
+                        &#128205; ${e.location || 'Unknown'}${organizer}<br>
+                        &#128279; <a href="${link}" target="_blank">${e.link}</a>
                     </div>
                 </div>
             </div>`;
@@ -173,50 +229,68 @@ def home():
         function renderSearch(data, query) {
             const container = document.getElementById("results");
             const events = data.events || [];
+            const past = data.past_events || [];
 
-            if (!events.length) {
+            if (!events.length && !past.length) {
                 container.innerHTML = '<div class="empty">No events found.</div>';
                 return;
             }
 
-            let html = `<div class="result-header">Returned <strong>${data.count} events</strong> for <strong>${query}</strong></div>`;
-            events.forEach((e, i) => { html += eventCard(i + 1, e); });
+            let html = '';
+            if (events.length) {
+                html += `<div class="result-header">Returned <strong>${data.count} events</strong> for <strong>${query}</strong></div>`;
+                events.forEach((e, i) => { html += eventCard(i + 1, e); });
+            }
+
+            if (past.length) {
+                html += `<div class="result-header" style="margin-top:24px; color:#b45309;">No upcoming events found — here are the last ${past.length} past events:</div>`;
+                past.forEach((e, i) => { html += eventCard(i + 1, e); });
+            }
+
             container.innerHTML = html;
         }
 
         function renderRecommend(data) {
             const container = document.getElementById("results");
             const recs = data.recommendations || [];
+            const popular = data.popular || [];
             const based = data.based_on || {};
 
-            if (!recs.length) {
+            if (!recs.length && !popular.length) {
                 container.innerHTML = '<div class="empty">No recommendations yet — try searching first!</div>';
                 return;
             }
 
-            // Split into personalised vs popular
-            // Popular = top by search_count; personalised = rest
-            const sorted = [...recs].sort((a, b) => b.popularity - a.popularity);
-            const popular = sorted.slice(0, 3);
-            const personalised = recs.filter(r => !popular.includes(r));
-
             let basedText = 'your recent searches';
-            if (based.recent_location) basedText += ` in <strong>${based.recent_location}</strong>`;
-            if (based.topics && based.topics.length) basedText += ` · topics: ${based.topics.slice(0,5).join(', ')}`;
-
+            if (based.topics && based.topics.length) basedText += ` &middot; topics: ${based.topics.slice(0,5).join(', ')}`;
             let html = `<div class="result-header">Based on ${basedText}</div>`;
 
-            if (personalised.length) {
+            if (recs.length) {
                 html += `<div class="section-header">Based on your searches</div>`;
-                personalised.forEach((e, i) => { html += eventCard(i + 1, e); });
+                recs.forEach((e, i) => { html += eventCard(i + 1, e); });
             }
 
+            html += `<div class="section-header">Popular events in ${based.recent_location || 'your area'}</div>`;
             if (popular.length) {
-                html += `<div class="section-header">Popular events in your area</div>`;
                 popular.forEach((e, i) => { html += eventCard(i + 1, e); });
+            } else {
+                html += `<div class="empty" style="padding:16px 0; text-align:left; font-size:13px; color:#9ca3af;">No popular events yet for this area — popularity is based on link clicks.</div>`;
             }
+
+            html += `
+            <div class="location-box">
+                <p>Show popular events in a specific location:</p>
+                <div class="row">
+                    <input id="ploc" placeholder="e.g. New York, San Francisco, London..." />
+                    <button onclick="recommend(document.getElementById('ploc').value)">Go</button>
+                </div>
+            </div>`;
 
             container.innerHTML = html;
+
+            document.getElementById("ploc").addEventListener("keydown", e => {
+                if (e.key === "Enter") recommend(document.getElementById("ploc").value);
+            });
         }
 
         document.getElementById("query").addEventListener("keydown", e => {

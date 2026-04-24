@@ -60,15 +60,42 @@ def _get_db_locations() -> List[str]:
 
 
 def _city_patterns_from_locations(resolved_locs: List[str]) -> List[str]:
+    """
+    Extract city-level patterns for SQL LIKE matching.
+    Uses the full location string directly to avoid country name false matches.
+    e.g. "Paris, France" -> search for "%Paris%" not "%France%"
+    """
+    # Words that are countries/regions, not cities — skip these
+    skip_words = {
+        "germany", "france", "spain", "netherlands", "switzerland",
+        "belgium", "italy", "japan", "india", "canada", "singapore",
+        "united kingdom", "uk", "usa", "united states"
+    }
     patterns = set()
     for loc in resolved_locs:
         parts = [p.strip() for p in loc.split(',')]
         for part in parts:
-            if (len(part) > 3
-                    and not re.match(r'^[A-Z]{2}$', part)
-                    and not any(c.isdigit() for c in part)
-                    and len(part) < 35):
-                patterns.add(part)
+            part_lower = part.lower()
+            # Skip state abbreviations (2 uppercase letters)
+            if re.match(r'^[A-Z]{2}$', part):
+                continue
+            # Skip digits
+            if any(c.isdigit() for c in part):
+                continue
+            # Skip country names
+            if part_lower in skip_words:
+                continue
+            # Skip very short parts
+            if len(part) <= 3:
+                continue
+            # Skip parts longer than 35 chars
+            if len(part) > 35:
+                continue
+            # Keep parts that end in (Country) format like "Paris (France)" — use whole string
+            if '(' in loc and loc not in patterns:
+                patterns.add(loc)
+                break
+            patterns.add(part)
     return list(patterns)
 
 
@@ -92,24 +119,21 @@ def parse_user_to_filters(user_text: str):
         "- keywords: topic/subject keywords only, never location words\n"
         "- location: location as user said it or null\n"
         "- resolved_locations: array of EXACT strings from the DB list below matching the user's location. [] if none.\n"
-        "- start_date: YYYY-MM-DD or null\n"
-        "- end_date: YYYY-MM-DD or null\n"
+        "- start_date: YYYY-MM-DD or null. Default to today's date (" + today + ") so past events are excluded. Only narrow further if user says next week, next month, in June etc.\n"
+        "- end_date: YYYY-MM-DD or null. Set only if user specifies a time window like next week or next month.\n"
         "- intent_type: one of [specific, explore, vague]\n\n"
         "Location matching rules for resolved_locations:\n"
-        "- Include venue-prefixed variants e.g. 'IBM, 425 Market, San Francisco, CA'\n"
-        "- east coast = New York, Boston, Chicago, Orlando + venue variants\n"
-        "- west coast = San Francisco, San Jose, Mountain View, Oakland, Stanford, San Diego, Tacoma + variants\n"
-        "- bay area = San Francisco, San Jose, Mountain View, Oakland, Stanford + variants\n"
-        "- europe = London, Berlin, Paris, Amsterdam, Madrid, Brussels, Gent, Lausanne + variants\n"
-        "- asia = Tokyo, Bangalore, Singapore\n"
-        "- online/virtual = Online\n"
+        "- Use your geographic knowledge to match any region, city, country or continent\n"
+        "- Be comprehensive and inclusive — if user says europe, return ALL European cities in the list\n"
+        "- Include venue-prefixed entries if the city matches e.g. 'IBM, 425 Market, San Francisco, CA'\n"
+        "- Match both formats: 'Paris, France' AND 'Paris (France)' for the same city\n"
         "- When in doubt INCLUDE rather than exclude\n\n"
         "Database locations:\n" + locations_list
     )
 
     try:
         resp = client.responses.create(
-            model="gpt-4.1-nano",
+            model="gpt-4.1",
             temperature=0,
             input=[
                 {"role": "system", "content": system_prompt},
@@ -151,7 +175,6 @@ def query_events(filters: SearchFilters, resolved_locs: List[str]) -> list:
             where.append("(" + loc_clauses + ")")
             params.extend(["%" + p + "%" for p in city_patterns])
     elif filters.location:
-        # Direct substring fallback
         where.append("location LIKE ?")
         params.append("%" + filters.location + "%")
 
@@ -172,7 +195,7 @@ def query_events(filters: SearchFilters, resolved_locs: List[str]) -> list:
     where_sql = " AND ".join(where)
 
     sql = (
-        "SELECT id, title, date_iso, location, link, website_source, cancelled, verified "
+        "SELECT id, title, date_iso, location, link, website_source, cancelled, verified, organizer "
         "FROM events WHERE " + where_sql + " "
         "ORDER BY CASE WHEN date_iso IS NULL THEN 1 ELSE 0 END, "
         "date_iso " + order_sql + ", title ASC "
@@ -278,53 +301,105 @@ def extract_location_from_queries(queries: List[str]) -> Optional[str]:
     return None
 
 
-def get_personalized_recommendations(limit: int = 10):
-    queries = get_recent_queries()
+def get_personalized_recommendations(limit: int = 10, user_location: str = "New York"):
+    queries = get_recent_queries(20)
 
-    stopwords = {
-        "events", "event", "in", "at", "near", "around", "from", "show",
-        "find", "get", "the", "and", "for", "with", "about", "some", "any"
+    import re as _re
+
+    time_words = {
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+        "today", "tomorrow", "week", "month", "next", "this"
     }
-    topic_keywords = set()
-    for q in queries:
-        for w in q.lower().split():
-            if len(w) > 3 and w not in stopwords:
-                topic_keywords.add(w)
+    action_words = {
+        "events", "event", "find", "show", "get", "list", "search"
+    }
+    location_preps = {"in", "at", "near", "around"}
 
-    recent_location = extract_location_from_queries(queries)
+    # Extract (location, topic) pairs from each query
+    locations = set()
+    topics = set()
+
+    for q in queries:
+        if not any(c.isalpha() for c in q):
+            continue
+        words = q.strip().lower().split()
+        # Strip time words from end
+        while words and words[-1] in time_words:
+            words.pop()
+        if words and words[-1] in ("in", "at", "near"):
+            words.pop()
+
+        loc_phrase = []
+        topic_words_found = []
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w in location_preps and i + 1 < len(words):
+                # Collect location phrase after prep
+                loc_phrase = []
+                i += 1
+                while i < len(words) and words[i] not in location_preps and words[i] not in action_words:
+                    if words[i] not in time_words:
+                        loc_phrase.append(words[i])
+                    i += 1
+                if loc_phrase:
+                    locations.add(" ".join(loc_phrase).title())
+            elif w not in action_words and w not in location_preps and w not in time_words and len(w) > 2:
+                topic_words_found.append(w)
+                i += 1
+            else:
+                i += 1
+
+        if topic_words_found:
+            topics.add(" ".join(topic_words_found).title())
+
+    # Combine locations and topics as search signals
+    topic_keywords = locations | topics
 
     conn = _conn()
-    clauses = []
-    params = []
+    kw_list = list(topic_keywords)
 
-    kw_list = list(topic_keywords)[:15]
-    if kw_list:
-        kw_parts = " OR ".join(["title LIKE ?" for _ in kw_list])
-        clauses.append("(" + kw_parts + ")")
-        params.extend(["%" + kw + "%" for kw in kw_list])
+    # Fetch 1-2 events per topic so all searched topics are represented
+    rows = []
+    seen_titles = set()
+    per_topic = max(1, limit // len(kw_list)) if kw_list else limit
 
-    where_sql = ("verified = 1 AND cancelled = 0 AND (" + " OR ".join(clauses) + ")"
-                 if clauses else "verified = 1 AND cancelled = 0")
+    for kw in kw_list:
+        topic_rows = conn.execute(
+            "SELECT title, date_iso, location, link, search_count, organizer FROM events "
+            "WHERE verified = 1 AND cancelled = 0 "
+            "AND (title LIKE ? OR location LIKE ?) "
+            "ORDER BY search_count DESC, date_iso ASC LIMIT ?",
+            ("%" + kw + "%", "%" + kw + "%", per_topic)
+        ).fetchall()
+        for r in topic_rows:
+            if r["title"] not in seen_titles:
+                seen_titles.add(r["title"])
+                rows.append(r)
 
-    rows = list(conn.execute(
-        "SELECT title, date_iso, location, link, search_count FROM events "
-        "WHERE " + where_sql + " ORDER BY search_count DESC, date_iso ASC LIMIT ?",
-        params + [limit]
-    ).fetchall())
-
+    # Pad with popular events if not enough results
     if len(rows) < limit:
-        existing = {r["title"] for r in rows}
         extra = conn.execute(
-            "SELECT title, date_iso, location, link, search_count FROM events "
+            "SELECT title, date_iso, location, link, search_count, organizer FROM events "
             "WHERE verified = 1 AND cancelled = 0 "
             "ORDER BY search_count DESC, date_iso ASC LIMIT ?", (limit,)
         ).fetchall()
         for r in extra:
-            if r["title"] not in existing and len(rows) < limit:
+            if r["title"] not in seen_titles and len(rows) < limit:
+                seen_titles.add(r["title"])
                 rows.append(r)
 
+    # Popular events = only events actually clicked by users in that location
+    popular = conn.execute(
+        "SELECT id, title, date_iso, location, link, search_count, organizer, COALESCE(click_count, 0) as click_count FROM events "
+        "WHERE verified = 1 AND cancelled = 0 AND location LIKE ? AND COALESCE(click_count, 0) > 0 "
+        "ORDER BY click_count DESC, date_iso ASC LIMIT 10",
+        ("%" + user_location + "%",)
+    ).fetchall()
+
     conn.close()
-    return rows, recent_location, list(topic_keywords)
+    return rows, user_location, list(topic_keywords), popular
 
 
 # -----------------------------
@@ -333,9 +408,8 @@ def get_personalized_recommendations(limit: int = 10):
 def ask_agent(user_text: str) -> str:
     log_search(user_text)
     filters, resolved_locs = parse_user_to_filters(user_text)
-    has_filters = bool(filters.location or filters.start_date or filters.end_date)
 
-    if has_filters or filters.intent_type == "specific":
+    if resolved_locs or filters.location or filters.start_date or filters.end_date:
         rows = query_events(filters, resolved_locs)
         if not rows and resolved_locs:
             rows = semantic_search(user_text, filters.limit, resolved_locs)
@@ -351,16 +425,26 @@ def ask_agent(user_text: str) -> str:
 def ask_agent_structured(user_text: str):
     log_search(user_text)
     filters, resolved_locs = parse_user_to_filters(user_text)
-    has_filters = bool(filters.location or filters.start_date or filters.end_date)
 
-    if has_filters or filters.intent_type == "specific":
+    past_events = []
+
+    if resolved_locs or filters.location or filters.start_date or filters.end_date:
         rows = query_events(filters, resolved_locs)
-        if not rows and resolved_locs:
+        # If no future events found but we had a date filter, look for past events
+        if not rows and filters.start_date and resolved_locs:
+            past_filters = filters.copy()
+            past_filters.start_date = None
+            past_filters.end_date = filters.start_date
+            past_filters.sort = "date_desc"
+            past_filters.limit = 3
+            past_rows = query_events(past_filters, resolved_locs)
+            past_events = past_rows
+        elif not rows and resolved_locs:
             rows = semantic_search(user_text, filters.limit, resolved_locs)
     else:
         rows = semantic_search(user_text, filters.limit, resolved_locs)
 
-    if not rows and not filters.location:
+    if not rows and not filters.location and not past_events:
         conn = _conn()
         rows = conn.execute(
             "SELECT * FROM events WHERE verified = 1 AND cancelled = 0 "
@@ -372,16 +456,30 @@ def ask_agent_structured(user_text: str):
     events = []
     for r in rows:
         events.append({
+            "id": r["id"],
             "title": r["title"],
             "date": r["date_iso"],
             "location": r["location"],
+            "organizer": r["organizer"] if "organizer" in r.keys() and r["organizer"] else None,
             "link": r["link"],
             "verified": bool(r["verified"]),
             "cancelled": bool(r["cancelled"]),
         })
 
+    past = []
+    for r in past_events:
+        past.append({
+            "id": r["id"],
+            "title": r["title"],
+            "date": r["date_iso"],
+            "location": r["location"],
+            "organizer": r["organizer"] if "organizer" in r.keys() and r["organizer"] else None,
+            "link": r["link"],
+        })
+
     return {
         "query": user_text,
         "count": len(events),
-        "events": events
+        "events": events,
+        "past_events": past
     }
