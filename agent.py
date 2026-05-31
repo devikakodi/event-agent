@@ -1,15 +1,15 @@
 import os
 import re
 import json
-import sqlite3
 from datetime import datetime
 from typing import Any, List, Optional
 import numpy as np
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
+from db import get_conn, PLACEHOLDER
 
-DB_PATH = "events.db"
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # -----------------------------
 # Schema
@@ -29,10 +29,24 @@ class SearchFilters(BaseModel):
 # -----------------------------
 # DB connection
 # -----------------------------
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _conn():
+    return get_conn()
+
+
+def _fetchall(conn, sql, params=()):
+    """Works for both psycopg2 and sqlite3"""
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    if DATABASE_URL:
+        cols = [desc[0] for desc in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    return cur.fetchall()
+
+
+def _execute(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    return cur
 
 
 def _safe_int(n: Any, default: int, lo: int, hi: int) -> int:
@@ -53,7 +67,7 @@ def _get_db_locations() -> List[str]:
     if _db_locations_cache is not None:
         return _db_locations_cache
     conn = _conn()
-    rows = conn.execute("SELECT DISTINCT location FROM events WHERE location IS NOT NULL").fetchall()
+    rows = _fetchall(conn, "SELECT DISTINCT location FROM events WHERE location IS NOT NULL")
     conn.close()
     _db_locations_cache = [r["location"] for r in rows if r["location"]]
     return _db_locations_cache
@@ -65,7 +79,6 @@ def _city_patterns_from_locations(resolved_locs: List[str]) -> List[str]:
     Uses the full location string directly to avoid country name false matches.
     e.g. "Paris, France" -> search for "%Paris%" not "%France%"
     """
-    # Words that are countries/regions, not cities — skip these
     skip_words = {
         "germany", "france", "spain", "netherlands", "switzerland",
         "belgium", "italy", "japan", "india", "canada", "singapore",
@@ -76,22 +89,16 @@ def _city_patterns_from_locations(resolved_locs: List[str]) -> List[str]:
         parts = [p.strip() for p in loc.split(',')]
         for part in parts:
             part_lower = part.lower()
-            # Skip state abbreviations (2 uppercase letters)
             if re.match(r'^[A-Z]{2}$', part):
                 continue
-            # Skip digits
             if any(c.isdigit() for c in part):
                 continue
-            # Skip country names
             if part_lower in skip_words:
                 continue
-            # Skip very short parts
             if len(part) <= 3:
                 continue
-            # Skip parts longer than 35 chars
             if len(part) > 35:
                 continue
-            # Keep parts that end in (Country) format like "Paris (France)" — use whole string
             if '(' in loc and loc not in patterns:
                 patterns.add(loc)
                 break
@@ -165,30 +172,31 @@ def parse_user_to_filters(user_text: str):
 # Query events — direct SQL
 # -----------------------------
 def query_events(filters: SearchFilters, resolved_locs: List[str]) -> list:
+    p = PLACEHOLDER
     where = ["verified = 1", "cancelled = 0"]
     params: List[Any] = []
 
     if resolved_locs:
         city_patterns = _city_patterns_from_locations(resolved_locs)
         if city_patterns:
-            loc_clauses = " OR ".join(["location LIKE ?" for _ in city_patterns])
+            loc_clauses = " OR ".join([f"location LIKE {p}" for _ in city_patterns])
             where.append("(" + loc_clauses + ")")
-            params.extend(["%" + p + "%" for p in city_patterns])
+            params.extend(["%" + pt + "%" for pt in city_patterns])
     elif filters.location:
-        where.append("location LIKE ?")
+        where.append(f"location LIKE {p}")
         params.append("%" + filters.location + "%")
 
     if filters.keywords:
-        kw_clauses = " OR ".join(["title LIKE ?" for _ in filters.keywords])
+        kw_clauses = " OR ".join([f"title LIKE {p}" for _ in filters.keywords])
         where.append("(" + kw_clauses + ")")
         params.extend(["%" + kw + "%" for kw in filters.keywords])
 
     if filters.start_date:
-        where.append("date_iso >= ?")
+        where.append(f"date_iso >= {p}")
         params.append(filters.start_date)
 
     if filters.end_date:
-        where.append("date_iso <= ?")
+        where.append(f"date_iso <= {p}")
         params.append(filters.end_date)
 
     order_sql = "ASC" if filters.sort == "date_asc" else "DESC"
@@ -204,9 +212,9 @@ def query_events(filters: SearchFilters, resolved_locs: List[str]) -> list:
 
     conn = _conn()
     try:
-        rows = conn.execute(sql, params).fetchall()
+        rows = _fetchall(conn, sql, params)
         for r in rows:
-            conn.execute("UPDATE events SET search_count = search_count + 1 WHERE id = ?", (r["id"],))
+            _execute(conn, f"UPDATE events SET search_count = search_count + 1 WHERE id = {p}", (r["id"],))
         conn.commit()
     except Exception as e:
         print("[DEBUG] SQL error:", e)
@@ -224,38 +232,31 @@ def embed_query(text):
 
 
 def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    a, b = np.array(a), np.array(b)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
 
 
-def semantic_search(user_text, limit=25, resolved_locs=None):
-    query_vec = embed_query(user_text)
+def semantic_search(user_text: str, limit: int = 25, resolved_locs: List[str] = []) -> list:
+    query_emb = embed_query(user_text)
 
     conn = _conn()
-    query = "SELECT * FROM events WHERE verified = 1 AND cancelled = 0"
-    params = []
-
-    if resolved_locs:
-        city_patterns = _city_patterns_from_locations(resolved_locs)
-        if city_patterns:
-            loc_clauses = " OR ".join(["location LIKE ?" for _ in city_patterns])
-            params.extend(["%" + p + "%" for p in city_patterns])
-            query += " AND (" + loc_clauses + ")"
-
-    rows = conn.execute(query, params).fetchall()
+    rows = _fetchall(conn, 
+        "SELECT id, title, date_iso, location, link, website_source, cancelled, verified, organizer, embedding "
+        "FROM events WHERE verified = 1 AND cancelled = 0 AND embedding IS NOT NULL"
+    )
     conn.close()
 
     scored = []
     for r in rows:
-        if not r["embedding"]:
+        try:
+            emb = json.loads(r["embedding"])
+            score = cosine_similarity(query_emb, emb)
+            scored.append((score, r))
+        except Exception:
             continue
-        event_vec = json.loads(r["embedding"])
-        semantic_score = cosine_similarity(query_vec, event_vec)
-        popularity = r["search_count"] or 0
-        popularity_norm = min(popularity / 10, 1)
-        score = 0.7 * semantic_score + 0.3 * popularity_norm
-        scored.append((score, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [r for _, r in scored[:limit]]
@@ -265,9 +266,10 @@ def semantic_search(user_text, limit=25, resolved_locs=None):
 # Logging
 # -----------------------------
 def log_search(user_text: str):
+    p = PLACEHOLDER
     conn = _conn()
-    conn.execute("INSERT INTO searches (query, timestamp) VALUES (?, ?)",
-                 (user_text, datetime.utcnow().isoformat()))
+    _execute(conn, f"INSERT INTO searches (query, timestamp) VALUES ({p}, {p})",
+             (user_text, datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
 
@@ -276,8 +278,9 @@ def log_search(user_text: str):
 # Personalization
 # -----------------------------
 def get_recent_queries(limit: int = 20) -> List[str]:
+    p = PLACEHOLDER
     conn = _conn()
-    rows = conn.execute("SELECT query FROM searches ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+    rows = _fetchall(conn, f"SELECT query FROM searches ORDER BY timestamp DESC LIMIT {p}", (limit,))
     conn.close()
     return [r["query"] for r in rows]
 
@@ -316,7 +319,6 @@ def get_personalized_recommendations(limit: int = 10, user_location: str = "New 
     }
     location_preps = {"in", "at", "near", "around"}
 
-    # Extract (location, topic) pairs from each query
     locations = set()
     topics = set()
 
@@ -324,7 +326,6 @@ def get_personalized_recommendations(limit: int = 10, user_location: str = "New 
         if not any(c.isalpha() for c in q):
             continue
         words = q.strip().lower().split()
-        # Strip time words from end
         while words and words[-1] in time_words:
             words.pop()
         if words and words[-1] in ("in", "at", "near"):
@@ -336,7 +337,6 @@ def get_personalized_recommendations(limit: int = 10, user_location: str = "New 
         while i < len(words):
             w = words[i]
             if w in location_preps and i + 1 < len(words):
-                # Collect location phrase after prep
                 loc_phrase = []
                 i += 1
                 while i < len(words) and words[i] not in location_preps and words[i] not in action_words:
@@ -354,49 +354,46 @@ def get_personalized_recommendations(limit: int = 10, user_location: str = "New 
         if topic_words_found:
             topics.add(" ".join(topic_words_found).title())
 
-    # Combine locations and topics as search signals
     topic_keywords = locations | topics
 
     conn = _conn()
     kw_list = list(topic_keywords)
 
-    # Fetch 1-2 events per topic so all searched topics are represented
     rows = []
     seen_titles = set()
     per_topic = max(1, limit // len(kw_list)) if kw_list else limit
+    p = PLACEHOLDER
 
     for kw in kw_list:
-        topic_rows = conn.execute(
-            "SELECT title, date_iso, location, link, search_count, organizer FROM events "
-            "WHERE verified = 1 AND cancelled = 0 "
-            "AND (title LIKE ? OR location LIKE ?) "
-            "ORDER BY search_count DESC, date_iso ASC LIMIT ?",
+        topic_rows = _fetchall(conn,
+            f"SELECT title, date_iso, location, link, search_count, organizer FROM events "
+            f"WHERE verified = 1 AND cancelled = 0 "
+            f"AND (title LIKE {p} OR location LIKE {p}) "
+            f"ORDER BY search_count DESC, date_iso ASC LIMIT {p}",
             ("%" + kw + "%", "%" + kw + "%", per_topic)
-        ).fetchall()
+        )
         for r in topic_rows:
             if r["title"] not in seen_titles:
                 seen_titles.add(r["title"])
                 rows.append(r)
 
-    # Pad with popular events if not enough results
     if len(rows) < limit:
-        extra = conn.execute(
-            "SELECT title, date_iso, location, link, search_count, organizer FROM events "
-            "WHERE verified = 1 AND cancelled = 0 "
-            "ORDER BY search_count DESC, date_iso ASC LIMIT ?", (limit,)
-        ).fetchall()
+        extra = _fetchall(conn,
+            f"SELECT title, date_iso, location, link, search_count, organizer FROM events "
+            f"WHERE verified = 1 AND cancelled = 0 "
+            f"ORDER BY search_count DESC, date_iso ASC LIMIT {p}", (limit,)
+        )
         for r in extra:
             if r["title"] not in seen_titles and len(rows) < limit:
                 seen_titles.add(r["title"])
                 rows.append(r)
 
-    # Popular events = only events actually clicked by users in that location
-    popular = conn.execute(
-        "SELECT id, title, date_iso, location, link, search_count, organizer, COALESCE(click_count, 0) as click_count FROM events "
-        "WHERE verified = 1 AND cancelled = 0 AND location LIKE ? AND COALESCE(click_count, 0) > 0 "
-        "ORDER BY click_count DESC, date_iso ASC LIMIT 10",
+    popular = _fetchall(conn,
+        f"SELECT id, title, date_iso, location, link, search_count, organizer, COALESCE(click_count, 0) as click_count FROM events "
+        f"WHERE verified = 1 AND cancelled = 0 AND location LIKE {p} AND COALESCE(click_count, 0) > 0 "
+        f"ORDER BY click_count DESC, date_iso ASC LIMIT 10",
         ("%" + user_location + "%",)
-    ).fetchall()
+    )
 
     conn.close()
     return rows, user_location, list(topic_keywords), popular
@@ -430,7 +427,6 @@ def ask_agent_structured(user_text: str):
 
     if resolved_locs or filters.location or filters.start_date or filters.end_date:
         rows = query_events(filters, resolved_locs)
-        # If no future events found but we had a date filter, look for past events
         if not rows and filters.start_date and resolved_locs:
             past_filters = filters.copy()
             past_filters.start_date = None
@@ -446,11 +442,11 @@ def ask_agent_structured(user_text: str):
 
     if not rows and not filters.location and not past_events:
         conn = _conn()
-        rows = conn.execute(
-            "SELECT * FROM events WHERE verified = 1 AND cancelled = 0 "
-            "ORDER BY search_count DESC, date_iso ASC LIMIT ?",
+        rows = _fetchall(conn,
+            f"SELECT * FROM events WHERE verified = 1 AND cancelled = 0 "
+            f"ORDER BY search_count DESC, date_iso ASC LIMIT {PLACEHOLDER}",
             (filters.limit,)
-        ).fetchall()
+        )
         conn.close()
 
     events = []

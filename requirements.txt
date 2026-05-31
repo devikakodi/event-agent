@@ -6,3 +6,4 @@ numpy
 beautifulsoup4
 python-dateutil
 requests
+psycopg2-binary

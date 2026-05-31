@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from agent import ask_agent_structured, get_personalized_recommendations
-import sqlite3
+from db import get_conn, PLACEHOLDER
 
 app = FastAPI()
 
@@ -50,14 +50,19 @@ def search_events(request: SearchRequest):
 
 @app.get("/click/{event_id}")
 def track_click(event_id: str):
-    conn = sqlite3.connect("events.db")
-    row = conn.execute("SELECT link FROM events WHERE id = ?", (event_id,)).fetchone()
+    p = PLACEHOLDER
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(f"SELECT link FROM events WHERE id = {p}", (event_id,))
+    row = cur.fetchone()
     if row:
-        conn.execute("UPDATE events SET click_count = COALESCE(click_count, 0) + 1 WHERE id = ?", (event_id,))
+        link = row[0] if not hasattr(row, 'keys') else row["link"]
+        cur.execute(f"UPDATE events SET click_count = COALESCE(click_count, 0) + 1 WHERE id = {p}", (event_id,))
         conn.commit()
-        link = row[0]
+        cur.close()
         conn.close()
         return RedirectResponse(url=link)
+    cur.close()
     conn.close()
     return JSONResponse(content={"error": "not found"}, status_code=404)
 
