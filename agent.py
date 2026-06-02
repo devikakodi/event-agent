@@ -426,6 +426,8 @@ def ask_agent(user_text: str) -> str:
 def ask_agent_structured(user_text: str):
     log_search(user_text)
     filters, resolved_locs = parse_user_to_filters(user_text)
+    filters, resolved_locs = parse_user_to_filters(user_text)
+    print(f"[DEBUG] query='{user_text}' resolved_locs={resolved_locs} start_date={filters.start_date}")
 
     past_events = []
 
