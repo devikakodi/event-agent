@@ -9,8 +9,14 @@ from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-DATABASE_URL = os.getenv("DATABASE_URL")
-P = "%s" if DATABASE_URL else "?"
+
+def _db_url():
+    return os.getenv("DATABASE_URL")
+ 
+def _P():
+    return "%s" if os.getenv("DATABASE_URL") else "?"
+
+
 
 # -----------------------------
 # DB connection
