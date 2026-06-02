@@ -73,8 +73,10 @@ def _get_db_locations() -> List[str]:
     conn = _conn()
     rows = _fetchall(conn, "SELECT DISTINCT location FROM events WHERE location IS NOT NULL")
     conn.close()
-    _db_locations_cache = [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
-    return _db_locations_cache
+    locs = [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
+    if not DATABASE_URL:
+        _db_locations_cache = locs
+    return locs
 
 
 def _city_patterns_from_locations(resolved_locs: List[str]) -> List[str]:
