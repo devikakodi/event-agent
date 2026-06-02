@@ -112,6 +112,8 @@ def parse_user_to_filters(user_text: str):
     today = datetime.now().date().isoformat()
     db_locations = _get_db_locations()
     locations_list = "\n".join("- " + l for l in db_locations)
+    print(f"[DEBUG] Total locations in DB: {len(db_locations)}")
+    print(f"[DEBUG] Sample locations: {db_locations[:10]}")
 
     stopwords = {
         "events", "event", "show", "shows", "find", "get", "list",

@@ -31,3 +31,5 @@ def run():
 
 if __name__ == "__main__":
     run()
+    import agent
+    agent._db_locations_cache = None
