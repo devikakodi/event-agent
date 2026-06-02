@@ -3,6 +3,7 @@ import re
 import json
 from datetime import datetime
 from typing import Any, List, Optional
+from unittest import result
 import numpy as np
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
@@ -68,15 +69,20 @@ _db_locations_cache: Optional[List[str]] = None
 
 def _get_db_locations() -> List[str]:
     global _db_locations_cache
-    if _db_locations_cache is not None and not DATABASE_URL:
+    if DATABASE_URL:
+        conn = _conn()
+        rows = _fetchall(conn, "SELECT DISTINCT location FROM events WHERE location IS NOT NULL")
+        conn.close()
+        locs = [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
+        print(f"[DEBUG] Total locations fetched: {len(locs)}")
+        return locs
+    if _db_locations_cache is not None:
         return _db_locations_cache
     conn = _conn()
     rows = _fetchall(conn, "SELECT DISTINCT location FROM events WHERE location IS NOT NULL")
     conn.close()
-    locs = [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
-    if not DATABASE_URL:
-        _db_locations_cache = locs
-    return locs
+    _db_locations_cache = [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
+    return _db_locations_cache
 
 
 def _city_patterns_from_locations(resolved_locs: List[str]) -> List[str]:
