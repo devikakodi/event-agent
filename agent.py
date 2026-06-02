@@ -69,6 +69,7 @@ _db_locations_cache: Optional[List[str]] = None
 
 def _get_db_locations() -> List[str]:
     global _db_locations_cache
+    print(f"[DEBUG] DATABASE_URL set: {bool(DATABASE_URL)}")
     if DATABASE_URL:
         conn = _conn()
         rows = _fetchall(conn, "SELECT DISTINCT location FROM events WHERE location IS NOT NULL")
