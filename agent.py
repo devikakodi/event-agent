@@ -74,23 +74,10 @@ def _safe_int(n: Any, default: int, lo: int, hi: int) -> int:
 _db_locations_cache: Optional[List[str]] = None
 
 def _get_db_locations() -> List[str]:
-    global _db_locations_cache
-    print(f"[DEBUG] DATABASE_URL set: {bool(DATABASE_URL)}")
-    if DATABASE_URL:
-        conn = _conn()
-        rows = _fetchall(conn, "SELECT DISTINCT location FROM events WHERE location IS NOT NULL")
-        conn.close()
-        locs = [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
-        print(f"[DEBUG] Total locations fetched: {len(locs)}")
-        return locs
-    if _db_locations_cache is not None:
-        return _db_locations_cache
     conn = _conn()
     rows = _fetchall(conn, "SELECT DISTINCT location FROM events WHERE location IS NOT NULL")
     conn.close()
-    _db_locations_cache = [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
-    return _db_locations_cache
-
+    return [r["location"] if isinstance(r, dict) else r[0] for r in rows if r]
 
 def _city_patterns_from_locations(resolved_locs: List[str]) -> List[str]:
     skip_words = {
