@@ -22,9 +22,9 @@ def _P():
 # DB connection
 # -----------------------------
 def _conn():
-    if DATABASE_URL:
+    if _db_url():
         import psycopg2
-        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        conn = psycopg2.connect(_db_url(), sslmode="require")
         return conn
     else:
         import sqlite3
@@ -35,7 +35,7 @@ def _conn():
 def _fetchall(conn, sql, params=()):
     cur = conn.cursor()
     cur.execute(sql, params)
-    if DATABASE_URL:
+    if _db_url():
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
     return cur.fetchall()
