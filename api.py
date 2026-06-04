@@ -3,7 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from agent import ask_agent_structured, get_personalized_recommendations
-from db import get_conn, PLACEHOLDER
+from db import get_conn, init_db
+from datetime import datetime
+import os
+import threading
 
 app = FastAPI()
 
@@ -13,6 +16,57 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -----------------------------
+# Track last scrape time
+# -----------------------------
+_last_scraped: str = "Never"
+
+def _run_scrape():
+    global _last_scraped
+    try:
+        from main import run
+        print("[Scheduler] Starting scheduled scrape...")
+        run()
+        _last_scraped = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        print(f"[Scheduler] Done. Last scraped: {_last_scraped}")
+    except Exception as e:
+        print(f"[Scheduler] Scrape failed: {e}")
+
+# -----------------------------
+# Auto-schedule daily scrape
+# -----------------------------
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(_run_scrape, 'interval', hours=24)
+    scheduler.start()
+    print("[Scheduler] Daily scrape scheduled.")
+except Exception as e:
+    print(f"[Scheduler] APScheduler not available: {e}")
+
+# -----------------------------
+# Keep-alive ping (every 10 min)
+# -----------------------------
+def _keep_alive():
+    import time
+    import urllib.request
+    url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not url:
+        return
+    while True:
+        try:
+            urllib.request.urlopen(url, timeout=10)
+            print("[KeepAlive] Pinged.")
+        except Exception:
+            pass
+        time.sleep(600)
+
+if os.getenv("RENDER_EXTERNAL_URL"):
+    t = threading.Thread(target=_keep_alive, daemon=True)
+    t.start()
+    print("[KeepAlive] Started.")
+
 
 class SearchRequest(BaseModel):
     query: str
@@ -50,13 +104,14 @@ def search_events(request: SearchRequest):
 
 @app.get("/click/{event_id}")
 def track_click(event_id: str):
-    p = PLACEHOLDER
-    conn = get_conn()
+    from agent import _P, _conn, _fetchall, _execute
+    p = _P()
+    conn = _conn()
     cur = conn.cursor()
     cur.execute(f"SELECT link FROM events WHERE id = {p}", (event_id,))
     row = cur.fetchone()
     if row:
-        link = row[0] if not hasattr(row, 'keys') else row["link"]
+        link = row[0] if not isinstance(row, dict) else row["link"]
         cur.execute(f"UPDATE events SET click_count = COALESCE(click_count, 0) + 1 WHERE id = {p}", (event_id,))
         conn.commit()
         cur.close()
@@ -68,7 +123,7 @@ def track_click(event_id: str):
 
 
 @app.get("/recommend")
-def recommend(limit: int =5, location: str = "New York"):
+def recommend(limit: int = 5, location: str = "New York"):
     rows, user_location, topics, popular = get_personalized_recommendations(limit, location)
     return JSONResponse(content={
         "based_on": {
@@ -77,29 +132,54 @@ def recommend(limit: int =5, location: str = "New York"):
         },
         "recommendations": [
             {
-                "id": r["id"] if "id" in r.keys() else "",
-                "title": r["title"],
-                "date": r["date_iso"],
-                "location": r["location"],
-                "organizer": r["organizer"] if r["organizer"] else None,
-                "link": r["link"],
-                "popularity": r["search_count"],
+                "id": r["id"] if isinstance(r, dict) and "id" in r else "",
+                "title": r["title"] if isinstance(r, dict) else r[0],
+                "date": r["date_iso"] if isinstance(r, dict) else r[1],
+                "location": r["location"] if isinstance(r, dict) else r[2],
+                "organizer": r.get("organizer") if isinstance(r, dict) else None,
+                "link": r["link"] if isinstance(r, dict) else r[3],
+                "popularity": r.get("search_count", 0) if isinstance(r, dict) else 0,
             }
             for r in rows
         ],
         "popular": [
             {
-                "id": r["id"] if "id" in r.keys() else "",
-                "title": r["title"],
-                "date": r["date_iso"],
-                "location": r["location"],
-                "organizer": r["organizer"] if r["organizer"] else None,
-                "link": r["link"],
-                "popularity": r["click_count"],
+                "id": r["id"] if isinstance(r, dict) and "id" in r else "",
+                "title": r["title"] if isinstance(r, dict) else r[0],
+                "date": r["date_iso"] if isinstance(r, dict) else r[1],
+                "location": r["location"] if isinstance(r, dict) else r[2],
+                "organizer": r.get("organizer") if isinstance(r, dict) else None,
+                "link": r["link"] if isinstance(r, dict) else r[3],
+                "popularity": r.get("click_count", 0) if isinstance(r, dict) else 0,
             }
             for r in popular
         ]
     })
+
+
+@app.get("/status")
+def status():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM events WHERE verified = 1 AND cancelled = 0")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM events WHERE verified = 1 AND cancelled = 0 AND date_iso >= %s" if os.getenv("DATABASE_URL") else "SELECT COUNT(*) FROM events WHERE verified = 1 AND cancelled = 0 AND date_iso >= ?", (datetime.utcnow().date().isoformat(),))
+        upcoming = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT website_source) FROM events")
+        sources = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return JSONResponse(content={
+            "status": "ok",
+            "event_count": total,
+            "upcoming_events": upcoming,
+            "sources": sources,
+            "last_scraped": _last_scraped,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return JSONResponse(content={"status": "error", "detail": str(e)}, status_code=500)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -113,8 +193,10 @@ def home():
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f9f9f9; color: #111; }
 
-        .header { background: #1a1a2e; color: white; padding: 20px 40px; }
+        .header { background: #1a1a2e; color: white; padding: 20px 40px; display: flex; align-items: center; justify-content: space-between; }
         .header h1 { font-size: 20px; font-weight: 600; letter-spacing: 0.3px; }
+        .header-meta { font-size: 12px; color: #9ca3af; text-align: right; }
+        .header-meta span { display: block; }
 
         .container { max-width: 720px; margin: 36px auto; padding: 0 20px; }
 
@@ -181,7 +263,11 @@ def home():
 </head>
 <body>
     <div class="header">
-        <h1>&#128269; Event Intelligence</h1>
+        <h1>&#128049; Event Intelligence</h1>
+        <div class="header-meta">
+            <span id="event-count">Loading...</span>
+            <span id="last-updated"></span>
+        </div>
     </div>
     <div class="container">
         <div class="search-bar">
@@ -193,6 +279,19 @@ def home():
     </div>
 
     <script>
+        // Load status on page load
+        async function loadStatus() {
+            try {
+                const res = await fetch("/status");
+                const data = await res.json();
+                document.getElementById("event-count").textContent = data.event_count + " events across " + data.sources + " sources";
+                if (data.last_scraped && data.last_scraped !== "Never") {
+                    document.getElementById("last-updated").textContent = "Last updated: " + data.last_scraped;
+                }
+            } catch(e) {}
+        }
+        loadStatus();
+
         async function search() {
             const query = document.getElementById("query").value.trim();
             if (!query) return;
