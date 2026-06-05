@@ -181,24 +181,24 @@ def query_events(filters: SearchFilters, resolved_locs: List[str]) -> list:
     if resolved_locs:
         city_patterns = _city_patterns_from_locations(resolved_locs)
         if city_patterns:
-            loc_clauses = " OR ".join([f"location LIKE {P}" for _ in city_patterns])
+            loc_clauses = " OR ".join([f"location LIKE {_P()}" for _ in city_patterns])
             where.append("(" + loc_clauses + ")")
             params.extend(["%" + p + "%" for p in city_patterns])
     elif filters.location:
-        where.append(f"location LIKE {P}")
+        where.append(f"location LIKE {_P()}")
         params.append("%" + filters.location + "%")
 
     if filters.keywords:
-        kw_clauses = " OR ".join([f"title LIKE {P}" for _ in filters.keywords])
+        kw_clauses = " OR ".join([f"title LIKE {_P()}" for _ in filters.keywords])
         where.append("(" + kw_clauses + ")")
         params.extend(["%" + kw + "%" for kw in filters.keywords])
 
     if filters.start_date:
-        where.append(f"date_iso >= {P}")
+        where.append(f"date_iso >= {_P()}")
         params.append(filters.start_date)
 
     if filters.end_date:
-        where.append(f"date_iso <= {P}")
+        where.append(f"date_iso <= {_P()}")
         params.append(filters.end_date)
 
     order_sql = "ASC" if filters.sort == "date_asc" else "DESC"
@@ -217,7 +217,7 @@ def query_events(filters: SearchFilters, resolved_locs: List[str]) -> list:
         rows = _fetchall(conn, sql, params)
         for r in rows:
             event_id = r["id"] if isinstance(r, dict) else r[0]
-            _execute(conn, f"UPDATE events SET search_count = search_count + 1 WHERE id = {P}", (event_id,))
+            _execute(conn, f"UPDATE events SET search_count = search_count + 1 WHERE id = {_P()}", (event_id,))
         conn.commit()
     except Exception as e:
         print("[DEBUG] SQL error:", e)
@@ -250,7 +250,7 @@ def semantic_search(user_text, limit=25, resolved_locs=None):
     if resolved_locs:
         city_patterns = _city_patterns_from_locations(resolved_locs)
         if city_patterns:
-            loc_clauses = " OR ".join([f"location LIKE {P}" for _ in city_patterns])
+            loc_clauses = " OR ".join([f"location LIKE {_P()}" for _ in city_patterns])
             params.extend(["%" + p + "%" for p in city_patterns])
             query += " AND (" + loc_clauses + ")"
 
@@ -278,7 +278,7 @@ def semantic_search(user_text, limit=25, resolved_locs=None):
 # -----------------------------
 def log_search(user_text: str):
     conn = _conn()
-    _execute(conn, f"INSERT INTO searches (query, timestamp) VALUES ({P}, {P})",
+    _execute(conn, f"INSERT INTO searches (query, timestamp) VALUES ({_P()}, {_P()})",
              (user_text, datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
@@ -289,7 +289,7 @@ def log_search(user_text: str):
 # -----------------------------
 def get_recent_queries(limit: int = 20) -> List[str]:
     conn = _conn()
-    rows = _fetchall(conn, f"SELECT query FROM searches ORDER BY timestamp DESC LIMIT {P}", (limit,))
+    rows = _fetchall(conn, f"SELECT query FROM searches ORDER BY timestamp DESC LIMIT {_P()}", (limit,))
     conn.close()
     return [r["query"] if isinstance(r, dict) else r[0] for r in rows]
 
@@ -374,8 +374,8 @@ def get_personalized_recommendations(limit: int = 10, user_location: str = "New 
         topic_rows = _fetchall(conn,
             f"SELECT title, date_iso, location, link, search_count, organizer FROM events "
             f"WHERE verified = 1 AND cancelled = 0 "
-            f"AND (title LIKE {P} OR location LIKE {P}) "
-            f"ORDER BY search_count DESC, date_iso ASC LIMIT {P}",
+            f"AND (title LIKE {_P()} OR location LIKE {_P()}) "
+            f"ORDER BY search_count DESC, date_iso ASC LIMIT {_P()}",
             ("%" + kw + "%", "%" + kw + "%", per_topic)
         )
         for r in topic_rows:
@@ -388,7 +388,7 @@ def get_personalized_recommendations(limit: int = 10, user_location: str = "New 
         extra = _fetchall(conn,
             f"SELECT title, date_iso, location, link, search_count, organizer FROM events "
             f"WHERE verified = 1 AND cancelled = 0 "
-            f"ORDER BY search_count DESC, date_iso ASC LIMIT {P}", (limit,)
+            f"ORDER BY search_count DESC, date_iso ASC LIMIT {_P()}", (limit,)
         )
         for r in extra:
             title = r["title"] if isinstance(r, dict) else r[0]
@@ -398,7 +398,7 @@ def get_personalized_recommendations(limit: int = 10, user_location: str = "New 
 
     popular = _fetchall(conn,
         f"SELECT id, title, date_iso, location, link, search_count, organizer, COALESCE(click_count, 0) as click_count FROM events "
-        f"WHERE verified = 1 AND cancelled = 0 AND location LIKE {P} AND COALESCE(click_count, 0) > 0 "
+        f"WHERE verified = 1 AND cancelled = 0 AND location LIKE {_P()} AND COALESCE(click_count, 0) > 0 "
         f"ORDER BY click_count DESC, date_iso ASC LIMIT 10",
         ("%" + user_location + "%",)
     )
@@ -454,7 +454,7 @@ def ask_agent_structured(user_text: str):
         conn = _conn()
         rows = _fetchall(conn,
             f"SELECT * FROM events WHERE verified = 1 AND cancelled = 0 "
-            f"ORDER BY search_count DESC, date_iso ASC LIMIT {P}",
+            f"ORDER BY search_count DESC, date_iso ASC LIMIT {_P()}",
             (filters.limit,)
         )
         conn.close()
