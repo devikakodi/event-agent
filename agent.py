@@ -8,6 +8,9 @@ import numpy as np
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
+import os
+print(f"[STARTUP] All env vars: {[k for k in os.environ.keys()]}")
+print(f"[STARTUP] DATABASE_URL: {'SET' if os.getenv('DATABASE_URL') else 'NOT SET'}")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def _db_url():
