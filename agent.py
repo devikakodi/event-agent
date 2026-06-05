@@ -133,7 +133,7 @@ def parse_user_to_filters(user_text: str):
         "- keywords: topic/subject keywords only, never location words\n"
         "- location: location as user said it or null\n"
         "- resolved_locations: array of EXACT strings from the DB list below matching the user's location. [] if none.\n"
-        "- start_date: YYYY-MM-DD or null. Only set if user explicitly says 'upcoming', 'next week', 'this month', 'in June' etc. Otherwise leave null.\n"
+        "- start_date: YYYY-MM-DD or null. Default to today's date (" + today + ") so past events are excluded. Only narrow further if user says next week, next month, in June etc.\n"
         "- end_date: YYYY-MM-DD or null. Set only if user specifies a time window like next week or next month.\n"
         "- intent_type: one of [specific, explore, vague]\n\n"
         "Location matching rules for resolved_locations:\n"
