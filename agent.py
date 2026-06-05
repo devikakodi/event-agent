@@ -24,6 +24,7 @@ def _P():
 def _conn():
     if _db_url():
         import psycopg2
+        print("[DEBUG] Connecting to PostgreSQL")
         conn = psycopg2.connect(_db_url(), sslmode="require")
         return conn
     else:
