@@ -188,7 +188,7 @@ def home():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Event Intelligence</title>
+    <title>AllyCat</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f9f9f9; color: #111; }
@@ -263,7 +263,7 @@ def home():
 </head>
 <body>
     <div class="header">
-        <h1>&#128049; Event Intelligence</h1>
+        <h1>&#128049; AllyCat</h1>
         <div class="header-meta">
             <span id="event-count">Loading...</span>
             <span id="last-updated"></span>

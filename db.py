@@ -2,39 +2,32 @@ import os
 import json
 from datetime import datetime
 
-# -------------------------------------------------------
-# Use PostgreSQL if DATABASE_URL is set (Render), else SQLite locally
-# -------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-if DATABASE_URL:
-    import psycopg2
-    import psycopg2.extras
-
-    def get_conn():
-        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+def get_conn():
+    if os.getenv("DATABASE_URL"):
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="require")
         return conn
-
-    PLACEHOLDER = "%s"
-    
-else:
-    import sqlite3
-
-    DB_PATH = "events.db"
-
-    def get_conn():
-        conn = sqlite3.connect(DB_PATH)
+    else:
+        import sqlite3
+        conn = sqlite3.connect("events.db")
         conn.row_factory = sqlite3.Row
         return conn
 
-    PLACEHOLDER = "?"
+
+def _ph():
+    """Return the right placeholder for the current DB"""
+    return "%s" if os.getenv("DATABASE_URL") else "?"
+
+PLACEHOLDER = "DYNAMIC"  # not used directly, use _ph() instead
 
 
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
+    p = _ph()
 
-    cur.execute(f"""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id TEXT PRIMARY KEY,
             title TEXT,
@@ -54,22 +47,24 @@ def init_db():
         )
     """)
 
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS searches (
-            id SERIAL PRIMARY KEY,
-            query TEXT,
-            timestamp TEXT
-        )
-    """ if DATABASE_URL else """
-        CREATE TABLE IF NOT EXISTS searches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            query TEXT,
-            timestamp TEXT
-        )
-    """)
+    if os.getenv("DATABASE_URL"):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS searches (
+                id SERIAL PRIMARY KEY,
+                query TEXT,
+                timestamp TEXT
+            )
+        """)
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT,
+                timestamp TEXT
+            )
+        """)
 
-    # Add missing columns if upgrading from old schema
-    if not DATABASE_URL:
+    if not os.getenv("DATABASE_URL"):
         try:
             cur.execute("ALTER TABLE events ADD COLUMN embedding TEXT")
         except Exception:
@@ -85,9 +80,10 @@ def init_db():
 
 
 def event_exists(event_id):
+    p = _ph()
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(f"SELECT 1 FROM events WHERE id = {PLACEHOLDER}", (event_id,))
+    cur.execute(f"SELECT 1 FROM events WHERE id = {p}", (event_id,))
     row = cur.fetchone()
     cur.close()
     conn.close()
@@ -106,6 +102,7 @@ def get_embedding(text):
 
 
 def upsert_event(e):
+    p = _ph()
     now = datetime.utcnow().isoformat()
     embedding_text = f"{e['title']} {e.get('location', '')} {e.get('website_source', '')}"
     if not e.get("embedding"):
@@ -117,7 +114,6 @@ def upsert_event(e):
 
     conn = get_conn()
     cur = conn.cursor()
-    p = PLACEHOLDER
 
     cur.execute(f"""
         INSERT INTO events (
